@@ -61,24 +61,40 @@ jobs:
             const url = `${cacheUrl}_apis/artifactcache/cache?keys=${encodeURIComponent(key)}&version=${version}`;
             core.info(`Looking up: ${url}`);
 
-            const resp = await fetch(url, {
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/json;api-version=6.0-preview.1',
-              },
+            // Use Node.js built-in https (same as @actions/http-client) rather
+            // than fetch(), which uses undici and is rejected by the CDN.
+            const https = require('https');
+            const { URL } = require('url');
+
+            const parsedUrl = new URL(url);
+            const { statusCode, body } = await new Promise((resolve, reject) => {
+              const req = https.get({
+                hostname: parsedUrl.hostname,
+                path: parsedUrl.pathname + parsedUrl.search,
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Accept': 'application/json;api-version=6.0-preview.1',
+                  'User-Agent': '@actions/cache',
+                },
+              }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+              });
+              req.on('error', reject);
             });
 
-            core.info(`Status: ${resp.status}`);
-            if (resp.status === 204) {
+            core.info(`Status: ${statusCode}`);
+            if (statusCode === 204) {
               core.info('Cache miss — archive not available yet (first run?)');
               return;
             }
-            if (!resp.ok) {
-              core.setFailed(`Cache lookup failed: ${resp.status} ${await resp.text()}`);
+            if (statusCode < 200 || statusCode >= 300) {
+              core.setFailed(`Cache lookup failed: ${statusCode} ${body}`);
               return;
             }
 
-            const entry = await resp.json();
+            const entry = JSON.parse(body);
             core.info(`Cache entry: ${JSON.stringify(entry, null, 2)}`);
 
             fs.writeFileSync('/tmp/archive-info.json', JSON.stringify({
