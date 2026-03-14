@@ -24,11 +24,21 @@ jobs:
           path: my-cached-dir
           key: demo-cache-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # The runner only injects ACTIONS_RUNTIME_TOKEN / ACTIONS_CACHE_URL into
+      # JavaScript action processes, not into bash `run:` steps. We use
+      # actions/github-script (a JS action) to read and print them.
       - name: Print ACTIONS_CACHE_URL and ACTIONS_RUNTIME_TOKEN
-        run: |
-          echo "ACTIONS_CACHE_URL=$ACTIONS_CACHE_URL"
-          # The token is usually masked in logs; print base64-encoded so you can decode it locally.
-          echo "ACTIONS_RUNTIME_TOKEN (base64): $(printf '%s' "$ACTIONS_RUNTIME_TOKEN" | base64 -w0)"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token    = process.env.ACTIONS_RUNTIME_TOKEN  || '';
+            const cacheUrl = process.env.ACTIONS_CACHE_URL       || '';
+            const resultsUrl = process.env.ACTIONS_RESULTS_URL   || '';
+
+            core.info(`ACTIONS_CACHE_URL:    ${cacheUrl}`);
+            core.info(`ACTIONS_RESULTS_URL:  ${resultsUrl}`);
+            // Print base64 so the value isn't swallowed by log masking
+            core.info(`ACTIONS_RUNTIME_TOKEN (base64): ${Buffer.from(token).toString('base64')}`);
 
       - name: Show cache version
         run: |
