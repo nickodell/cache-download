@@ -1,0 +1,59 @@
+name: Cache Demo
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  cache-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create files to cache
+        run: |
+          mkdir -p my-cached-dir
+          echo "hello from file1" > my-cached-dir/file1.txt
+          echo "hello from file2" > my-cached-dir/file2.txt
+          date --iso-8601=seconds > my-cached-dir/timestamp.txt
+          echo "Created files:"
+          ls -la my-cached-dir/
+
+      - name: Cache the directory
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: my-cached-dir
+          key: demo-cache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Print ACTIONS_CACHE_URL and ACTIONS_RUNTIME_TOKEN
+        run: |
+          echo "ACTIONS_CACHE_URL=$ACTIONS_CACHE_URL"
+          # The token is usually masked in logs; print base64-encoded so you can decode it locally.
+          echo "ACTIONS_RUNTIME_TOKEN (base64): $(printf '%s' "$ACTIONS_RUNTIME_TOKEN" | base64 -w0)"
+
+      - name: Show cache version
+        run: |
+          node -e "
+          const crypto = require('crypto');
+
+          // Replicates @actions/cache getCacheVersion() from cacheUtils.ts
+          // version = SHA256([...paths, compressionMethod, '1.0'].join('|'))
+          // On Linux the compression method is 'zstd' (falls back to 'zstd-without-long' or 'gzip').
+          const paths = ['my-cached-dir'];
+          const compressionMethod = 'zstd';
+          const versionSalt = '1.0';
+
+          const components = [...paths, compressionMethod, versionSalt];
+          const joined = components.join('|');
+          const version = crypto.createHash('sha256').update(joined).digest('hex');
+
+          console.log('Paths:             ', paths);
+          console.log('Compression method:', compressionMethod);
+          console.log('Version salt:      ', versionSalt);
+          console.log('Joined components: ', joined);
+          console.log('Cache version:     ', version);
+          "
+
+      - name: Show cache key used
+        run: |
+          echo "Cache key: demo-cache-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
