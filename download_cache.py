@@ -75,7 +75,7 @@ def compute_cache_version(
 
 def _headers(token: str) -> dict:
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {token.strip()}",
         "Accept": "application/json;api-version=6.0-preview.1",
     }
 
@@ -100,17 +100,26 @@ def get_cache_entry(
             "archiveLocation": "https://..."   # pre-signed download URL
         }
     """
+    cache_url = cache_url.strip()
     if not cache_url.endswith("/"):
         cache_url += "/"
     url = f"{cache_url}_apis/artifactcache/cache"
-    resp = requests.get(
-        url,
-        headers=_headers(token),
+
+    # Build and inspect the prepared request before sending so we can see
+    # the exact URL urllib3 will put on the wire.
+    req = requests.Request(
+        "GET", url, headers=_headers(token),
         params={"keys": key, "version": version},
-        timeout=30,
     )
+    prepared = req.prepare()
+    print(f"  → GET {prepared.url}")
+
+    session = requests.Session()
+    resp = session.send(prepared, timeout=30)
+
     if resp.status_code == 204:
         return None  # cache miss
+    print(resp.content)
     resp.raise_for_status()
     return resp.json()
 
@@ -172,26 +181,34 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    # --- Direct archive mode (preferred from outside GitHub's network) ---
     parser.add_argument(
-        "--cache-url", required=True,
-        help="Value of ACTIONS_CACHE_URL printed by the workflow (ends with '/').",
+        "--archive-url",
+        help="Pre-signed archiveLocation URL from the archive-info artifact. "
+             "When provided, skips the IP-restricted cache API lookup entirely.",
+    )
+    # --- Cache API mode (only works from within GitHub's runner network) ---
+    parser.add_argument(
+        "--cache-url",
+        help="Value of ACTIONS_CACHE_URL (required without --archive-url).",
     )
     parser.add_argument(
-        "--token", required=True,
-        help="Value of ACTIONS_RUNTIME_TOKEN (decode from base64 first if needed).",
+        "--token",
+        help="Value of ACTIONS_RUNTIME_TOKEN (required without --archive-url).",
     )
     parser.add_argument(
-        "--key", required=True,
+        "--key",
         help="Exact cache key used in the actions/cache step.",
     )
     parser.add_argument(
-        "--paths", required=True, nargs="+",
+        "--paths", nargs="+",
         help="The path(s) listed under `path:` in the actions/cache step.",
     )
+    # --- Shared options ---
     parser.add_argument(
         "--compression", default="zstd",
         choices=["zstd", "zstd-without-long", "gzip"],
-        help="Compression method used when the cache was created (default: zstd on Linux/macOS).",
+        help="Compression method (default: zstd on Linux/macOS).",
     )
     parser.add_argument(
         "--platform", default="linux",
@@ -208,27 +225,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # 1. Compute the cache version (must match what the action computed).
-    version = compute_cache_version(args.paths, args.compression, args.platform)
-    print(f"Cache version : {version}")
-    print(f"Cache key     : {args.key}")
-    print(f"Paths         : {args.paths}")
-    print(f"Compression   : {args.compression}")
-    print()
+    if args.archive_url:
+        # --- Direct mode: use the pre-signed URL from the archive-info artifact ---
+        print("Using pre-signed archive URL (direct mode — no API lookup needed).")
+        archive_url = args.archive_url.strip()
+    else:
+        # --- API mode: look up the cache entry via the internal cache service ---
+        if not args.cache_url or not args.token or not args.key or not args.paths:
+            parser.error(
+                "Without --archive-url, you must supply --cache-url, --token, --key, and --paths.\n"
+                "Note: the cache API is IP-restricted to GitHub's runner network; "
+                "use --archive-url from the archive-info artifact instead."
+            )
 
-    # 2. Look up the cache entry.
-    print("Querying cache service…")
-    entry = get_cache_entry(args.cache_url, args.token, args.key, version)
-    if entry is None:
-        print("Cache MISS — no entry found for this key + version.")
-        sys.exit(1)
+        version = compute_cache_version(args.paths, args.compression, args.platform)
+        print(f"Cache version : {version}")
+        print(f"Cache key     : {args.key}")
+        print(f"Paths         : {args.paths}")
+        print(f"Compression   : {args.compression}")
+        print()
 
-    print(f"Cache HIT!")
-    print(f"  cacheKey     : {entry.get('cacheKey')}")
-    print(f"  cacheVersion : {entry.get('cacheVersion')}")
-    print(f"  creationTime : {entry.get('creationTime')}")
-    archive_url = entry["archiveLocation"]
-    print()
+        print("Querying cache service…")
+        entry = get_cache_entry(args.cache_url, args.token, args.key, version)
+        if entry is None:
+            print("Cache MISS — no entry found for this key + version.")
+            sys.exit(1)
+
+        print(f"Cache HIT!")
+        print(f"  cacheKey     : {entry.get('cacheKey')}")
+        print(f"  cacheVersion : {entry.get('cacheVersion')}")
+        print(f"  creationTime : {entry.get('creationTime')}")
+        archive_url = entry["archiveLocation"]
+        print()
 
     # 3. Download the archive to a temp file.
     suffix = ".tar.zst" if args.compression != "gzip" else ".tar.gz"

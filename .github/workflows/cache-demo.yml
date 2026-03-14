@@ -17,64 +17,80 @@ jobs:
           echo "Created files:"
           ls -la my-cached-dir/
 
+      # Fixed key so the cache persists across runs and can be looked up.
       - name: Cache the directory
         id: cache
         uses: actions/cache@v4
         with:
           path: my-cached-dir
-          key: demo-cache-${{ github.run_id }}-${{ github.run_attempt }}
-
-      # The runner only injects ACTIONS_RUNTIME_TOKEN / ACTIONS_CACHE_URL into
-      # JavaScript action processes, not into bash `run:` steps. We use
-      # actions/github-script (a JS action) to read them.
-      # The token is masked in every log encoding the runner detects, so we
-      # write credentials to a file and upload as an artifact instead.
-      - name: Write credentials to file
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const token      = process.env.ACTIONS_RUNTIME_TOKEN || '';
-            const cacheUrl   = process.env.ACTIONS_CACHE_URL     || '';
-            const resultsUrl = process.env.ACTIONS_RESULTS_URL   || '';
-
-            core.info(`ACTIONS_CACHE_URL:   ${cacheUrl}`);
-            core.info(`ACTIONS_RESULTS_URL: ${resultsUrl}`);
-
-            fs.writeFileSync('/tmp/cache-creds.txt',
-              `ACTIONS_CACHE_URL=${cacheUrl}\nACTIONS_RESULTS_URL=${resultsUrl}\nACTIONS_RUNTIME_TOKEN=${token}\n`
-            );
-
-      - name: Upload credentials artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cache-creds
-          path: /tmp/cache-creds.txt
+          key: demo-cache-files
 
       - name: Show cache version
         run: |
           node -e "
           const crypto = require('crypto');
-
-          // Replicates @actions/cache getCacheVersion() from cacheUtils.ts
           // version = SHA256([...paths, compressionMethod, '1.0'].join('|'))
-          // On Linux the compression method is 'zstd' (falls back to 'zstd-without-long' or 'gzip').
-          const paths = ['my-cached-dir'];
-          const compressionMethod = 'zstd';
-          const versionSalt = '1.0';
-
-          const components = [...paths, compressionMethod, versionSalt];
-          const joined = components.join('|');
-          const version = crypto.createHash('sha256').update(joined).digest('hex');
-
-          console.log('Paths:             ', paths);
-          console.log('Compression method:', compressionMethod);
-          console.log('Version salt:      ', versionSalt);
-          console.log('Joined components: ', joined);
-          console.log('Cache version:     ', version);
+          const components = ['my-cached-dir', 'zstd', '1.0'];
+          const version = crypto.createHash('sha256').update(components.join('|')).digest('hex');
+          console.log('Cache key:    demo-cache-files');
+          console.log('Cache version:', version);
           "
 
-      - name: Show cache key used
-        run: |
-          echo "Cache key: demo-cache-${{ github.run_id }}-${{ github.run_attempt }}"
-          echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
+      # artifactcache.actions.githubusercontent.com is IP-restricted to GitHub's
+      # runner network, so we call the internal lookup API from inside the workflow
+      # and write the pre-signed archiveLocation blob URL to an artifact.
+      # That URL is a plain Azure Blob Storage SAS URL accessible from anywhere.
+      - name: Fetch cache archive URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const crypto = require('crypto');
+            const fs = require('fs');
+
+            const token    = process.env.ACTIONS_RUNTIME_TOKEN || '';
+            const cacheUrl = (process.env.ACTIONS_CACHE_URL || '').replace(/\/?$/, '/');
+
+            core.info(`ACTIONS_CACHE_URL: ${cacheUrl}`);
+
+            // Replicate getCacheVersion() from @actions/cache cacheUtils.ts
+            const version = crypto.createHash('sha256')
+              .update(['my-cached-dir', 'zstd', '1.0'].join('|'))
+              .digest('hex');
+
+            const key = 'demo-cache-files';
+            const url = `${cacheUrl}_apis/artifactcache/cache?keys=${encodeURIComponent(key)}&version=${version}`;
+            core.info(`Looking up: ${url}`);
+
+            const resp = await fetch(url, {
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/json;api-version=6.0-preview.1',
+              },
+            });
+
+            core.info(`Status: ${resp.status}`);
+            if (resp.status === 204) {
+              core.info('Cache miss — archive not available yet (first run?)');
+              return;
+            }
+            if (!resp.ok) {
+              core.setFailed(`Cache lookup failed: ${resp.status} ${await resp.text()}`);
+              return;
+            }
+
+            const entry = await resp.json();
+            core.info(`Cache entry: ${JSON.stringify(entry, null, 2)}`);
+
+            fs.writeFileSync('/tmp/archive-info.json', JSON.stringify({
+              archiveLocation: entry.archiveLocation,
+              cacheKey: entry.cacheKey,
+              cacheVersion: entry.cacheVersion,
+              version,
+            }, null, 2));
+
+      - name: Upload archive info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-info
+          path: /tmp/archive-info.json
+          if-no-files-found: warn
